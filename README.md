@@ -112,5 +112,4 @@ This project uses the following Python libraries:
 *   `pyttsx3`
 *   `mediapipe`
 
-## Project structure (suggested)
 
