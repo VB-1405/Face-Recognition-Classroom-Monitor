@@ -113,28 +113,15 @@ class ClassroomMonitor:
         cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         self.face_cascade = cv2.CascadeClassifier(cascade_path)
         
-        # Try to initialize MediaPipe if available
-        self.use_mediapipe = False
-        try:
-            if mp_face_mesh and mp_face_detection:
-                self.face_mesh = mp_face_mesh.FaceMesh(
-                    max_num_faces=25,
-                    refine_landmarks=True,
-                    min_detection_confidence=0.5,
-                    min_tracking_confidence=0.5
-                )
-                self.face_detection = mp_face_detection.FaceDetection(
-                    min_detection_confidence=0.7
-                )
-                self.use_mediapipe = True
-                print("✓ MediaPipe initialized successfully")
-        except Exception as e:
-            print(f"Using OpenCV Haar Cascades (MediaPipe unavailable: {e})")
+        # Initialize face recognizer
+        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
+        self.label_to_name = {}
         
         # Data storage
         self.data_dir = "data"
         self.faces_dir = os.path.join(self.data_dir, "faces")
         self.encodings_file = os.path.join(self.data_dir, "students.pkl")
+        self.trainer_file = os.path.join(self.data_dir, "trainer.yml")
         self.logs_dir = "logs"
         
         # Create directories if they don't exist
@@ -143,6 +130,7 @@ class ClassroomMonitor:
         
         # Load existing students
         self.students = self.load_students()
+        self.load_trained_model()
         
         # Mouth detection parameters (for MediaPipe)
         self.UPPER_LIP = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291]
@@ -151,9 +139,6 @@ class ClassroomMonitor:
         # Alert tracking
         self.last_alert_time = {}
         self.alert_cooldown = 10  # seconds between alerts for same student
-        
-        # Motion detection for talking (when MediaPipe not available)
-        self.previous_frames = {}
         
         # Audio monitoring thread
         self.monitoring_active = False
@@ -187,7 +172,7 @@ class ClassroomMonitor:
         """Monitor audio levels in background thread"""
         if not self.audio_available:
             return
-        
+                
         try:
             self.audio_stream = self.pyaudio_instance.open(
                 format=self.FORMAT,
@@ -211,12 +196,50 @@ class ClassroomMonitor:
                 self.audio_stream.stop_stream()
                 self.audio_stream.close()
         
+    def load_trained_model(self):
+        """Load the trained face recognition model."""
+        if os.path.exists(self.trainer_file):
+            self.recognizer.read(self.trainer_file)
+            print("✓ Face recognition model loaded.")
+
+    def train_model(self):
+        """Train the face recognizer with enrolled student images."""
+        print("\nTraining face recognition model...")
+        faces = []
+        labels = []
+        
+        for name, student_data in self.students.items():
+            student_id = student_data['id']
+            student_dir = os.path.join(self.faces_dir, name)
+            
+            for image_name in os.listdir(student_dir):
+                if image_name.startswith("face_"):
+                    image_path = os.path.join(student_dir, image_name)
+                    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+                    if img is not None:
+                        faces.append(img)
+                        labels.append(student_id)
+        
+        if not faces:
+            print("⚠ No faces found to train the model.")
+            return
+
+        self.recognizer.train(faces, np.array(labels))
+        self.recognizer.write(self.trainer_file)
+        
+        print(f"✓ Model trained with {len(faces)} images and saved to {self.trainer_file}")
+        self.speak_alert("The face recognition model has been successfully trained.")
+
     def load_students(self):
         """Load enrolled students from file - PERSISTENT STORAGE"""
         if os.path.exists(self.encodings_file):
             try:
                 with open(self.encodings_file, 'rb') as f:
                     students = pickle.load(f)
+                
+                # Update label_to_name mapping
+                self.label_to_name = {data['id']: name for name, data in students.items()}
+
                 print(f"✓ Loaded {len(students)} enrolled students from disk")
                 return students
             except Exception as e:
@@ -232,6 +255,7 @@ class ClassroomMonitor:
             print(f"✓ Student data saved to disk ({len(self.students)} students)")
         except Exception as e:
             print(f"⚠ Error saving student data: {e}")
+
     
     def calculate_mouth_aspect_ratio(self, landmarks):
         """Calculate mouth aspect ratio to detect talking"""
@@ -250,46 +274,25 @@ class ClassroomMonitor:
         except:
             return 0
     
-    def detect_motion_in_face(self, face_id, current_face):
-        """Detect motion in face region (alternative to lip detection)"""
-        if face_id not in self.previous_frames:
-            self.previous_frames[face_id] = current_face
-            return False
-        
-        prev_face = self.previous_frames[face_id]
-        
-        # Resize to same size if needed
-        if current_face.shape != prev_face.shape:
-            current_face = cv2.resize(current_face, (prev_face.shape[1], prev_face.shape[0]))
-        
-        # Calculate difference
-        diff = cv2.absdiff(prev_face, current_face)
-        gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray_diff, 30, 255, cv2.THRESH_BINARY)
-        
-        # Calculate motion percentage
-        motion_pixels = np.sum(thresh > 0)
-        total_pixels = thresh.size
-        motion_percentage = (motion_pixels / total_pixels) * 100
-        
-        self.previous_frames[face_id] = current_face.copy()
-        
-        # Threshold for talking detection (adjust as needed)
-        return motion_percentage > 5
+
     
     def enroll_student(self, name):
-        """Enroll a new student"""
+        """Enroll a new student by capturing face images."""
+        if name in self.students:
+            print(f"✗ Student '{name}' is already enrolled.")
+            self.speak_alert(f"{name} is already enrolled.")
+            return
+
         print(f"\n{'='*50}")
         print(f"ENROLLING STUDENT: {name}")
         print(f"{'='*50}")
         print("Please look directly at the camera...")
-        print("Collecting face data...")
+        print("Collecting face data... (15 samples)")
         
         cap = cv2.VideoCapture(0)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         
-        face_encodings = []
         frames_collected = 0
         target_frames = 15
         
@@ -304,7 +307,6 @@ class ClassroomMonitor:
             frame = cv2.flip(frame, 1)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             
-            # Detect faces using OpenCV
             faces = self.face_cascade.detectMultiScale(
                 gray, 
                 scaleFactor=1.1, 
@@ -313,17 +315,10 @@ class ClassroomMonitor:
             )
             
             if len(faces) > 0:
-                # Use the first detected face
                 (x, y, w, h) = faces[0]
                 
                 # Draw rectangle
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                
-                # Save face encoding
-                face_encodings.append({
-                    'bbox': [x, y, w, h],
-                    'frame': frames_collected
-                })
                 
                 # Save face image
                 face_img = frame[y:y+h, x:x+w]
@@ -335,8 +330,6 @@ class ClassroomMonitor:
                 progress = int((frames_collected / target_frames) * 100)
                 cv2.putText(frame, f"Enrolling: {progress}%", (50, 50), 
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(frame, f"{name}", (50, 100), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             else:
                 cv2.putText(frame, "No face detected", (50, 50), 
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
@@ -349,28 +342,41 @@ class ClassroomMonitor:
         cap.release()
         cv2.destroyAllWindows()
         
-        # Save student data PERMANENTLY
+        if frames_collected < target_frames:
+            print(f"\n✗ Enrollment for {name} cancelled.")
+            # Clean up created directory if enrollment is not completed
+            if os.path.exists(student_dir):
+                for file_name in os.listdir(student_dir):
+                    os.remove(os.path.join(student_dir, file_name))
+                os.rmdir(student_dir)
+            return
+
+        # Assign a new unique ID
+        new_id = max(self.label_to_name.keys()) + 1 if self.label_to_name else 1
+        
         self.students[name] = {
+            'id': new_id,
             'name': name,
             'enrolled_date': datetime.now().isoformat(),
-            'encodings': face_encodings,
             'total_alerts': 0
         }
-        self.save_students()  # Save to disk immediately
+        self.save_students()
         
         print(f"\n✓ {name} enrolled successfully!")
-        print(f"  Collected {frames_collected} face samples")
-        print(f"  Saved to: {student_dir}")
-        print(f"  Data permanently stored in: {self.encodings_file}")
-        
-        # Welcome message
-        self.speak_alert(f"Welcome {name}! You are now enrolled in the classroom monitoring system.")
+        print("Please run 'Train Model' from the main menu to include the new student in the recognition system.")
+        self.speak_alert(f"Welcome {name}! Please ask the administrator to train the model to complete your enrollment.")
     
     def start_monitoring(self):
         """Start monitoring the classroom"""
         print(f"\n{'='*50}")
         print("STARTING CLASSROOM MONITORING")
         print(f"{'='*50}")
+        
+        if not os.path.exists(self.trainer_file):
+            print("⚠ Face recognition model not trained. Please train the model first.")
+            self.speak_alert("The face recognition model has not been trained yet. Please train the model from the main menu.")
+            return
+
         print(f"Enrolled Students: {len(self.students)}")
         for student_name in self.students.keys():
             print(f"  - {student_name}")
@@ -426,26 +432,20 @@ class ClassroomMonitor:
                     minSize=(100, 100)
                 )
                 
-                for idx, (x, y, w, h) in enumerate(faces):
-                    student_name = self.identify_student(x, y, w, h)
+                for (x, y, w, h) in faces:
+                    face_roi = gray[y:y+h, x:x+w]
+                    student_name, confidence = self.identify_student(face_roi)
                     
-                    # Only check visual motion if audio not available
-                    is_talking = False
-                    if not self.audio_available:
-                        face_region = frame[y:y+h, x:x+w]
-                        is_talking = self.detect_motion_in_face(f"face_{idx}", face_region)
-                    else:
-                        # Use audio-based detection
-                        is_talking = noise_detected
+                    is_talking = noise_detected
                     
-                    color = (0, 0, 255) if is_talking else (0, 255, 0)
+                    color = (0, 0, 255) if is_talking and student_name != "Unknown" else (0, 255, 0)
                     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
                     
-                    label = f"{student_name if student_name else 'Unknown'}"
+                    label = f"{student_name} ({confidence:.2f})"
                     cv2.putText(frame, label, (x, y - 10), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                     
-                    if is_talking and student_name:
+                    if is_talking and student_name != "Unknown":
                         cv2.putText(frame, "TALKING", (x, y + h + 25), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                         self.send_alert(student_name)
@@ -462,12 +462,10 @@ class ClassroomMonitor:
                 cv2.putText(frame, f"Audio: {int(self.current_decibel)} dB", (10, 90), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, db_color, 2)
                 
-                # Draw audio level bar
                 bar_width = int((self.current_decibel / 100) * 200)
                 cv2.rectangle(frame, (10, 100), (10 + bar_width, 115), db_color, -1)
                 cv2.rectangle(frame, (10, 100), (210, 115), (255, 255, 255), 2)
                 
-                # Draw threshold line
                 threshold_x = 10 + int((self.decibel_threshold / 100) * 200)
                 cv2.line(frame, (threshold_x, 100), (threshold_x, 115), (0, 255, 255), 2)
             
@@ -487,13 +485,19 @@ class ClassroomMonitor:
         print(f"Duration: {session_duration:.0f} seconds")
         print(f"{'='*50}\n")
     
-    def identify_student(self, x, y, width, height):
-        """Identify student based on face position"""
-        if self.students:
-            position_hash = (x // 100) + (y // 100)
-            student_names = list(self.students.keys())
-            return student_names[position_hash % len(student_names)]
-        return None
+    def identify_student(self, face_image):
+        """Identify student from a face image using the trained LBPH model."""
+        if not self.label_to_name:
+            return "Unknown", 0
+
+        label, confidence = self.recognizer.predict(face_image)
+        
+        # Lower confidence is better
+        if confidence < 100:  # Confidence threshold (adjust as needed)
+            name = self.label_to_name.get(label, "Unknown")
+            return name, confidence
+        
+        return "Unknown", confidence
     
     def speak_alert(self, message):
         """Speak the alert message in a separate thread"""
@@ -615,14 +619,15 @@ def main():
         print("CLASSROOM QUIET MONITOR")
         print("="*50)
         print("1. Enroll Student")
-        print("2. Start Monitoring")
-        print("3. List Students")
-        print("4. Delete Student")
-        print("5. Adjust Decibel Threshold")
-        print("6. Exit")
+        print("2. Train Model")
+        print("3. Start Monitoring")
+        print("4. List Students")
+        print("5. Delete Student")
+        print("6. Adjust Decibel Threshold")
+        print("7. Exit")
         print("="*50)
         
-        choice = input("\nSelect option (1-6): ").strip()
+        choice = input("\nSelect option (1-7): ").strip()
         
         if choice == '1':
             name = input("Enter student name: ").strip()
@@ -632,22 +637,25 @@ def main():
                 print("Invalid name")
         
         elif choice == '2':
+            monitor.train_model()
+
+        elif choice == '3':
             if not monitor.students:
                 print("\n⚠ Please enroll at least one student first!")
                 monitor.speak_alert("Please enroll at least one student before starting monitoring.")
             else:
                 monitor.start_monitoring()
         
-        elif choice == '3':
+        elif choice == '4':
             monitor.list_students()
         
-        elif choice == '4':
+        elif choice == '5':
             monitor.list_students()
             name = input("Enter student name to delete: ").strip()
             if name:
                 monitor.delete_student(name)
         
-        elif choice == '5':
+        elif choice == '6':
             if monitor.audio_available:
                 print(f"\nCurrent threshold: {monitor.decibel_threshold} dB")
                 print("Suggested values:")
@@ -668,7 +676,7 @@ def main():
             else:
                 print("\n⚠ Audio monitoring not available on this system")
         
-        elif choice == '6':
+        elif choice == '7':
             print("\nGoodbye!")
             monitor.speak_alert("Goodbye! Have a great day.")
             if monitor.pyaudio_instance:
